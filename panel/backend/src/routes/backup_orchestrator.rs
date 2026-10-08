@@ -1,15 +1,15 @@
 use axum::{
+    Json,
     extract::{Path, Query, State},
     http::StatusCode,
-    Json,
 };
 use uuid::Uuid;
 
+use crate::AppState;
 use crate::auth::{AdminUser, AuthUser, ServerScope};
-use crate::error::{internal_error, err, agent_error, paginate, require_admin, ApiError};
+use crate::error::{ApiError, agent_error, err, internal_error, paginate, require_admin};
 use crate::services::activity;
 use crate::services::extensions::fire_event;
-use crate::AppState;
 
 // ── Types ───────────────────────────────────────────────────────────────────
 
@@ -372,15 +372,19 @@ pub async fn preflight(
     AdminUser(_claims): AdminUser,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     use crate::services::prerequisites::backups::{
-        check_any_policy_enabled, check_backup_destination, PolicyDestinationFacts,
+        PolicyDestinationFacts, check_any_policy_enabled, check_backup_destination,
     };
 
     let db = &state.db;
 
     let (sites,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM sites")
-        .fetch_one(db).await.map_err(|e| internal_error("preflight", e))?;
+        .fetch_one(db)
+        .await
+        .map_err(|e| internal_error("preflight", e))?;
     let (destinations,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM backup_destinations")
-        .fetch_one(db).await.map_err(|e| internal_error("preflight", e))?;
+        .fetch_one(db)
+        .await
+        .map_err(|e| internal_error("preflight", e))?;
 
     // LEFT JOIN so a policy pointing at a deleted destination is distinguishable
     // from one that never chose: `destination_id` set with a NULL name.
@@ -416,23 +420,39 @@ pub async fn health(
     let db = &state.db;
 
     let (total_site,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM backups")
-        .fetch_one(db).await.map_err(|e| internal_error("health", e))?;
+        .fetch_one(db)
+        .await
+        .map_err(|e| internal_error("health", e))?;
     let (total_db,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM database_backups")
-        .fetch_one(db).await.map_err(|e| internal_error("health", e))?;
+        .fetch_one(db)
+        .await
+        .map_err(|e| internal_error("health", e))?;
     let (total_vol,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM volume_backups")
-        .fetch_one(db).await.map_err(|e| internal_error("health", e))?;
+        .fetch_one(db)
+        .await
+        .map_err(|e| internal_error("health", e))?;
 
     // SUM(BIGINT) returns NUMERIC in postgres — cast back to bigint so sqlx can
     // decode into Option<i64>. Empty rowsets give NULL, populated ones used to
     // 500 with "INT8 not compatible with NUMERIC" until this cast was added.
-    let (site_storage,): (Option<i64>,) = sqlx::query_as("SELECT SUM(size_bytes)::bigint FROM backups")
-        .fetch_one(db).await.map_err(|e| internal_error("health", e))?;
-    let (db_storage,): (Option<i64>,) = sqlx::query_as("SELECT SUM(size_bytes)::bigint FROM database_backups")
-        .fetch_one(db).await.map_err(|e| internal_error("health", e))?;
-    let (vol_storage,): (Option<i64>,) = sqlx::query_as("SELECT SUM(size_bytes)::bigint FROM volume_backups")
-        .fetch_one(db).await.map_err(|e| internal_error("health", e))?;
+    let (site_storage,): (Option<i64>,) =
+        sqlx::query_as("SELECT SUM(size_bytes)::bigint FROM backups")
+            .fetch_one(db)
+            .await
+            .map_err(|e| internal_error("health", e))?;
+    let (db_storage,): (Option<i64>,) =
+        sqlx::query_as("SELECT SUM(size_bytes)::bigint FROM database_backups")
+            .fetch_one(db)
+            .await
+            .map_err(|e| internal_error("health", e))?;
+    let (vol_storage,): (Option<i64>,) =
+        sqlx::query_as("SELECT SUM(size_bytes)::bigint FROM volume_backups")
+            .fetch_one(db)
+            .await
+            .map_err(|e| internal_error("health", e))?;
 
-    let total_storage = site_storage.unwrap_or(0) + db_storage.unwrap_or(0) + vol_storage.unwrap_or(0);
+    let total_storage =
+        site_storage.unwrap_or(0) + db_storage.unwrap_or(0) + vol_storage.unwrap_or(0);
 
     // Count successful schedules in last 24h
     let (success_24h,): (i64,) = sqlx::query_as(
@@ -442,15 +462,26 @@ pub async fn health(
         "SELECT COUNT(*) FROM backup_schedules WHERE last_status = 'failed' AND last_run > NOW() - INTERVAL '24 hours'"
     ).fetch_one(db).await.map_err(|e| internal_error("health", e))?;
 
-    let (policies_active,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM backup_policies WHERE enabled = TRUE")
-        .fetch_one(db).await.map_err(|e| internal_error("health", e))?;
+    let (policies_active,): (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM backup_policies WHERE enabled = TRUE")
+            .fetch_one(db)
+            .await
+            .map_err(|e| internal_error("health", e))?;
     let (policies_total,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM backup_policies")
-        .fetch_one(db).await.map_err(|e| internal_error("health", e))?;
+        .fetch_one(db)
+        .await
+        .map_err(|e| internal_error("health", e))?;
 
-    let (verif_passed,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM backup_verifications WHERE status = 'passed'")
-        .fetch_one(db).await.map_err(|e| internal_error("health", e))?;
-    let (verif_failed,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM backup_verifications WHERE status = 'failed'")
-        .fetch_one(db).await.map_err(|e| internal_error("health", e))?;
+    let (verif_passed,): (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM backup_verifications WHERE status = 'passed'")
+            .fetch_one(db)
+            .await
+            .map_err(|e| internal_error("health", e))?;
+    let (verif_failed,): (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM backup_verifications WHERE status = 'failed'")
+            .fetch_one(db)
+            .await
+            .map_err(|e| internal_error("health", e))?;
 
     // Find stale sites (no backup in > 7 days)
     //
@@ -472,23 +503,31 @@ pub async fn health(
                                         AND (b.destination_id IS NULL OR b.uploaded) \
          GROUP BY s.id, s.domain \
          HAVING MAX(b.created_at) IS NULL OR MAX(b.created_at) < NOW() - INTERVAL '7 days' \
-         ORDER BY MAX(b.created_at) NULLS FIRST LIMIT 10"
-    ).fetch_all(db).await
-    .map_err(|e| { tracing::error!("backup health: stale-site query failed: {e}"); e })
+         ORDER BY MAX(b.created_at) NULLS FIRST LIMIT 10",
+    )
+    .fetch_all(db)
+    .await
+    .map_err(|e| {
+        tracing::error!("backup health: stale-site query failed: {e}");
+        e
+    })
     .unwrap_or_default();
 
     let now = chrono::Utc::now();
-    let stale_backups: Vec<StaleBackup> = stale_sites.into_iter().map(|(domain, last)| {
-        StaleBackup {
-            resource_type: "site".into(),
-            resource_name: domain,
-            // None = never backed up at all. `days_since` is left null rather
-            // than faked from epoch so the UI can say so instead of printing an
-            // arithmetic artefact like "20789 days".
-            days_since: last.map(|l| (now - l).num_days()),
-            last_backup: last,
-        }
-    }).collect();
+    let stale_backups: Vec<StaleBackup> = stale_sites
+        .into_iter()
+        .map(|(domain, last)| {
+            StaleBackup {
+                resource_type: "site".into(),
+                resource_name: domain,
+                // None = never backed up at all. `days_since` is left null rather
+                // than faked from epoch so the UI can say so instead of printing an
+                // arithmetic artefact like "20789 days".
+                days_since: last.map(|l| (now - l).num_days()),
+                last_backup: last,
+            }
+        })
+        .collect();
 
     // ── SLA windowed view (W1.1) ────────────────────────────────────────────
     // "Of the last N backups across all kinds, how many are verified?"
@@ -550,9 +589,10 @@ pub async fn health(
          SELECT \
             PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY hours)::float8 AS p50, \
             PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY hours)::float8 AS p95 \
-         FROM lags"
+         FROM lags",
     )
-    .fetch_one(db).await
+    .fetch_one(db)
+    .await
     .unwrap_or((None, None));
 
     // Oldest unverified backup age in days (across all kinds, ignoring backups > 90d old).
@@ -569,9 +609,10 @@ pub async fn health(
          LEFT JOIN backup_verifications bv \
               ON bv.backup_id = ab.id AND bv.backup_type = ab.kind AND bv.status = 'passed' \
          WHERE bv.id IS NULL \
-           AND ab.created_at > NOW() - INTERVAL '90 days'"
+           AND ab.created_at > NOW() - INTERVAL '90 days'",
     )
-    .fetch_one(db).await
+    .fetch_one(db)
+    .await
     .ok()
     .flatten();
 
@@ -611,9 +652,10 @@ pub async fn health(
          LEFT JOIN servers s ON s.id = j.server_id \
          GROUP BY j.server_id, s.name \
          ORDER BY total DESC \
-         LIMIT 20"
+         LIMIT 20",
     )
-    .fetch_all(db).await
+    .fetch_all(db)
+    .await
     .map_err(|e| {
         tracing::error!("backup health: per-server SLA query failed: {e}");
         sla_unavailable = true;
@@ -621,10 +663,17 @@ pub async fn health(
     })
     .unwrap_or_default();
 
-    let per_server_sla: Vec<ServerSla> = per_server_rows.into_iter()
-        .map(|(server_id, server_name, verified, total, lag_p95_hours)| ServerSla {
-            server_id, server_name, verified, total, lag_p95_hours,
-        })
+    let per_server_sla: Vec<ServerSla> = per_server_rows
+        .into_iter()
+        .map(
+            |(server_id, server_name, verified, total, lag_p95_hours)| ServerSla {
+                server_id,
+                server_name,
+                verified,
+                total,
+                lag_p95_hours,
+            },
+        )
         .collect();
 
     // Drill counts (last 30d).
@@ -633,9 +682,10 @@ pub async fn health(
             COUNT(*) FILTER (WHERE status = 'passed')::bigint, \
             COUNT(*) FILTER (WHERE status = 'failed')::bigint \
          FROM backup_drills \
-         WHERE created_at > NOW() - INTERVAL '30 days'"
+         WHERE created_at > NOW() - INTERVAL '30 days'",
     )
-    .fetch_one(db).await
+    .fetch_one(db)
+    .await
     .unwrap_or((0, 0));
 
     Ok(Json(BackupHealth {
@@ -673,7 +723,7 @@ pub async fn list_policies(
 ) -> Result<Json<Vec<BackupPolicy>>, ApiError> {
     require_admin(&claims.role)?;
     let policies: Vec<BackupPolicy> = sqlx::query_as(
-        "SELECT * FROM backup_policies WHERE user_id = $1 ORDER BY created_at DESC LIMIT 500"
+        "SELECT * FROM backup_policies WHERE user_id = $1 ORDER BY created_at DESC LIMIT 500",
     )
     .bind(claims.sub)
     .fetch_all(&state.db)
@@ -691,16 +741,25 @@ pub async fn create_policy(
 ) -> Result<(StatusCode, Json<BackupPolicy>), ApiError> {
     require_admin(&claims.role)?;
     if req.name.is_empty() || req.name.len() > 100 {
-        return Err(err(StatusCode::BAD_REQUEST, "Name must be 1-100 characters"));
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            "Name must be 1-100 characters",
+        ));
     }
 
     let schedule = req.schedule.unwrap_or_else(|| "0 2 * * *".into());
     if !is_valid_cron_5(&schedule) {
-        return Err(err(StatusCode::BAD_REQUEST, "schedule must be a 5-field cron string"));
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            "schedule must be a 5-field cron string",
+        ));
     }
     let drill_schedule = req.drill_schedule.unwrap_or_else(|| "0 4 * * 0".into());
     if !is_valid_cron_5(&drill_schedule) {
-        return Err(err(StatusCode::BAD_REQUEST, "drill_schedule must be a 5-field cron string"));
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            "drill_schedule must be a 5-field cron string",
+        ));
     }
     let retention = req.retention_count.unwrap_or(7).max(1).min(365);
 
@@ -730,13 +789,25 @@ pub async fn create_policy(
     .map_err(|e| internal_error("create policy", e))?;
 
     activity::log_activity(
-        &state.db, claims.sub, &claims.email, "backup_policy.create",
-        Some("backup_policy"), Some(&req.name), None, None, claims.key_id,
-    ).await;
+        &state.db,
+        claims.sub,
+        &claims.email,
+        "backup_policy.create",
+        Some("backup_policy"),
+        Some(&req.name),
+        None,
+        None,
+        claims.key_id,
+    )
+    .await;
 
-    fire_event(&state.db, "backup_policy.created", serde_json::json!({
-        "policy_id": policy.id, "name": &req.name,
-    }));
+    fire_event(
+        &state.db,
+        "backup_policy.created",
+        serde_json::json!({
+            "policy_id": policy.id, "name": &req.name,
+        }),
+    );
 
     Ok((StatusCode::CREATED, Json(policy)))
 }
@@ -772,12 +843,18 @@ pub async fn update_policy(
 
     if let Some(s) = &req.schedule {
         if !s.is_empty() && !is_valid_cron_5(s) {
-            return Err(err(StatusCode::BAD_REQUEST, "schedule must be a 5-field cron string"));
+            return Err(err(
+                StatusCode::BAD_REQUEST,
+                "schedule must be a 5-field cron string",
+            ));
         }
     }
     if let Some(s) = &req.drill_schedule {
         if !s.is_empty() && !is_valid_cron_5(s) {
-            return Err(err(StatusCode::BAD_REQUEST, "drill_schedule must be a 5-field cron string"));
+            return Err(err(
+                StatusCode::BAD_REQUEST,
+                "drill_schedule must be a 5-field cron string",
+            ));
         }
     }
 
@@ -797,7 +874,7 @@ pub async fn update_policy(
          drill_enabled = COALESCE($13, drill_enabled), \
          drill_schedule = COALESCE(NULLIF($14, ''), drill_schedule), \
          updated_at = NOW() \
-         WHERE id = $1 RETURNING *"
+         WHERE id = $1 RETURNING *",
     )
     .bind(id)
     .bind(&req.name)
@@ -828,8 +905,10 @@ pub async fn delete_policy(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     require_admin(&claims.role)?;
     let result = sqlx::query("DELETE FROM backup_policies WHERE id = $1 AND user_id = $2")
-        .bind(id).bind(claims.sub)
-        .execute(&state.db).await
+        .bind(id)
+        .bind(claims.sub)
+        .execute(&state.db)
+        .await
         .map_err(|e| internal_error("delete policy", e))?;
 
     if result.rows_affected() == 0 {
@@ -849,16 +928,22 @@ pub async fn protect_all(
     let policy_name = "Protect Everything";
 
     // Check if already exists
-    let existing: Option<(Uuid,)> = sqlx::query_as(
-        "SELECT id FROM backup_policies WHERE user_id = $1 AND name = $2"
-    )
-    .bind(claims.sub).bind(policy_name)
-    .fetch_optional(db).await
-    .map_err(|e| internal_error("protect all", e))?;
+    let existing: Option<(Uuid,)> =
+        sqlx::query_as("SELECT id FROM backup_policies WHERE user_id = $1 AND name = $2")
+            .bind(claims.sub)
+            .bind(policy_name)
+            .fetch_optional(db)
+            .await
+            .map_err(|e| internal_error("protect all", e))?;
 
     if let Some((existing_id,)) = existing {
-        return Err(err(StatusCode::CONFLICT,
-            &format!("Policy '{}' already exists (id: {})", policy_name, existing_id)));
+        return Err(err(
+            StatusCode::CONFLICT,
+            &format!(
+                "Policy '{}' already exists (id: {})",
+                policy_name, existing_id
+            ),
+        ));
     }
 
     let policy: BackupPolicy = sqlx::query_as(
@@ -873,24 +958,39 @@ pub async fn protect_all(
     .map_err(|e| internal_error("protect all", e))?;
 
     activity::log_activity(
-        db, claims.sub, &claims.email, "backup_policy.protect_all",
-        Some("backup_policy"), Some(policy_name), None, None, claims.key_id,
-    ).await;
+        db,
+        claims.sub,
+        &claims.email,
+        "backup_policy.protect_all",
+        Some("backup_policy"),
+        Some(policy_name),
+        None,
+        None,
+        claims.key_id,
+    )
+    .await;
 
-    fire_event(db, "backup_policy.created", serde_json::json!({
-        "policy_id": policy.id, "name": policy_name, "preset": "protect-all",
-    }));
+    fire_event(
+        db,
+        "backup_policy.created",
+        serde_json::json!({
+            "policy_id": policy.id, "name": policy_name, "preset": "protect-all",
+        }),
+    );
 
-    Ok((StatusCode::CREATED, Json(serde_json::json!({
-        "id": policy.id,
-        "name": policy_name,
-        "schedule": "0 2 * * *",
-        "backup_sites": true,
-        "backup_databases": true,
-        "backup_volumes": true,
-        "retention_count": 7,
-        "verify_after_backup": true,
-    }))))
+    Ok((
+        StatusCode::CREATED,
+        Json(serde_json::json!({
+            "id": policy.id,
+            "name": policy_name,
+            "schedule": "0 2 * * *",
+            "backup_sites": true,
+            "backup_databases": true,
+            "backup_volumes": true,
+            "retention_count": 7,
+            "verify_after_backup": true,
+        })),
+    ))
 }
 
 // ── Database Backups ────────────────────────────────────────────────────────
@@ -910,10 +1010,12 @@ pub async fn create_db_backup(
     let row: Option<(Uuid, String, String, String, String, Option<Uuid>)> = sqlx::query_as(
         "SELECT d.id, d.name, d.engine, d.db_user, d.db_password_enc, s.server_id \
          FROM databases d JOIN sites s ON d.site_id = s.id \
-         WHERE d.id = $1 AND s.user_id = $2"
+         WHERE d.id = $1 AND s.user_id = $2",
     )
-    .bind(req.database_id).bind(claims.sub)
-    .fetch_optional(&state.db).await
+    .bind(req.database_id)
+    .bind(claims.sub)
+    .fetch_optional(&state.db)
+    .await
     .map_err(|e| internal_error("create db backup", e))?;
 
     let (db_id, db_name, engine, user, password_enc, server_id) =
@@ -939,12 +1041,15 @@ pub async fn create_db_backup(
     // `backup_policy_executor` runs this exact dump from the same join and has always
     // resolved `agents.for_server(s.server_id)` for it. The scheduled path was right and
     // the operator-pressed button never adopted it — that asymmetry is the whole defect.
-    let agent = crate::helpers::agent_for_site_server(
-        &state, server_id, &format!("database {db_name}"),
-    ).await?;
+    let agent =
+        crate::helpers::agent_for_site_server(&state, server_id, &format!("database {db_name}"))
+            .await?;
 
     // Decrypt the database password (handles both encrypted and legacy plaintext)
-    let password = crate::services::secrets_crypto::decrypt_credential_or_legacy(&password_enc, &state.config.jwt_secret);
+    let password = crate::services::secrets_crypto::decrypt_credential_or_legacy(
+        &password_enc,
+        &state.config.jwt_secret,
+    );
 
     // Container name follows convention: dockpanel-db-{name}
     let container_name = format!("dockpanel-db-{db_name}");
@@ -967,15 +1072,28 @@ pub async fn create_db_backup(
         "encryption_key": encryption_key,
     });
 
-    let result = agent.post("/db-backups/dump", Some(body)).await
+    let result = agent
+        .post("/db-backups/dump", Some(body))
+        .await
         .map_err(|e| agent_error("Database backup", e))?;
 
-    let filename = result.get("filename").and_then(|v| v.as_str()).unwrap_or("").to_string();
-    let size_bytes = result.get("size_bytes").and_then(|v| v.as_u64()).unwrap_or(0) as i64;
+    let filename = result
+        .get("filename")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let size_bytes = result
+        .get("size_bytes")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as i64;
     let encrypted = encryption_key.is_some();
 
     // v2.8.2: integrity chain — same pattern as routes/backups.rs for site backups.
-    let sha256_hash = result.get("sha256").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let sha256_hash = result
+        .get("sha256")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
     let previous_hash: Option<String> = sqlx::query_scalar::<_, Option<String>>(
         "SELECT sha256_hash FROM database_backups WHERE database_id = $1 ORDER BY created_at DESC LIMIT 1"
     ).bind(db_id).fetch_optional(&state.db).await.unwrap_or(None).flatten();
@@ -992,20 +1110,35 @@ pub async fn create_db_backup(
     .map_err(|e| internal_error("create db backup", e))?;
 
     activity::log_activity(
-        &state.db, claims.sub, &claims.email, "db_backup.create",
-        Some("database"), Some(&db_name), Some(&filename), None, claims.key_id,
-    ).await;
+        &state.db,
+        claims.sub,
+        &claims.email,
+        "db_backup.create",
+        Some("database"),
+        Some(&db_name),
+        Some(&filename),
+        None,
+        claims.key_id,
+    )
+    .await;
 
-    fire_event(&state.db, "db_backup.created", serde_json::json!({
-        "database": &db_name, "filename": &filename, "size_bytes": size_bytes, "encrypted": encrypted,
-    }));
+    fire_event(
+        &state.db,
+        "db_backup.created",
+        serde_json::json!({
+            "database": &db_name, "filename": &filename, "size_bytes": size_bytes, "encrypted": encrypted,
+        }),
+    );
 
-    Ok((StatusCode::CREATED, Json(serde_json::json!({
-        "id": backup.id,
-        "filename": filename,
-        "size_bytes": size_bytes,
-        "encrypted": encrypted,
-    }))))
+    Ok((
+        StatusCode::CREATED,
+        Json(serde_json::json!({
+            "id": backup.id,
+            "filename": filename,
+            "size_bytes": size_bytes,
+            "encrypted": encrypted,
+        })),
+    ))
 }
 
 /// GET /api/backup-orchestrator/db-backups — List database backups.
@@ -1046,7 +1179,10 @@ pub async fn delete_db_backup(
     let backup = backup.ok_or_else(|| err(StatusCode::NOT_FOUND, "Backup not found"))?;
 
     // Validate filename before constructing agent path (prevent path traversal from stored data)
-    if backup.filename.contains('/') || backup.filename.contains("..") || backup.filename.contains('\0') {
+    if backup.filename.contains('/')
+        || backup.filename.contains("..")
+        || backup.filename.contains('\0')
+    {
         return Err(err(StatusCode::BAD_REQUEST, "Invalid backup filename"));
     }
 
@@ -1060,16 +1196,23 @@ pub async fn delete_db_backup(
     // policy-driven dumps are named per database, so it does — the wrong machine's
     // backup was destroyed instead.
     let agent = crate::helpers::agent_for_site_server(
-        &state, backup.server_id, &format!("database {}", backup.db_name),
-    ).await?;
+        &state,
+        backup.server_id,
+        &format!("database {}", backup.db_name),
+    )
+    .await?;
 
     // Delete from agent
     let agent_path = format!("/db-backups/{}/{}", backup.db_name, backup.filename);
-    agent.delete(&agent_path).await
+    agent
+        .delete(&agent_path)
+        .await
         .map_err(|e| agent_error("Delete backup", e))?;
 
     sqlx::query("DELETE FROM database_backups WHERE id = $1")
-        .bind(id).execute(&state.db).await
+        .bind(id)
+        .execute(&state.db)
+        .await
         .map_err(|e| internal_error("delete db backup", e))?;
 
     Ok(Json(serde_json::json!({ "ok": true })))
@@ -1106,22 +1249,29 @@ pub async fn restore_db_backup(
     // refused; if that host has since stopped running the container, the agent fails
     // loudly, which is the direction that can be recovered from.
     let agent = crate::helpers::agent_for_site_server(
-        &state, backup.server_id, &format!("database {}", backup.db_name),
-    ).await?;
+        &state,
+        backup.server_id,
+        &format!("database {}", backup.db_name),
+    )
+    .await?;
 
     // Fetch database credentials (join with sites for user/password)
     let creds: Option<(String, String, String)> = sqlx::query_as(
-        "SELECT d.engine, d.db_user, d.db_password_enc FROM databases d WHERE d.id = $1"
+        "SELECT d.engine, d.db_user, d.db_password_enc FROM databases d WHERE d.id = $1",
     )
     .bind(backup.database_id)
-    .fetch_optional(&state.db).await
+    .fetch_optional(&state.db)
+    .await
     .map_err(|e| internal_error("restore db backup", e))?;
 
     let (_engine, user, password_enc) =
         creds.ok_or_else(|| err(StatusCode::NOT_FOUND, "Database not found"))?;
 
     // Decrypt the database password (handles both encrypted and legacy plaintext)
-    let password = crate::services::secrets_crypto::decrypt_credential_or_legacy(&password_enc, &state.config.jwt_secret);
+    let password = crate::services::secrets_crypto::decrypt_credential_or_legacy(
+        &password_enc,
+        &state.config.jwt_secret,
+    );
 
     let container_name = format!("dockpanel-db-{}", backup.db_name);
 
@@ -1140,10 +1290,12 @@ pub async fn restore_db_backup(
     // silently derive the WRONG passphrase for every backup older than
     // whatever the derivation happens to be today.
     let encryption_key: Option<String> = if backup.encrypted {
-        Some(crate::services::backup_policy_executor::derive_backup_encryption_key_for_version(
-            backup.encryption_key_version,
-            &state.config.jwt_secret,
-        ))
+        Some(
+            crate::services::backup_policy_executor::derive_backup_encryption_key_for_version(
+                backup.encryption_key_version,
+                &state.config.jwt_secret,
+            ),
+        )
     } else {
         None
     };
@@ -1160,8 +1312,13 @@ pub async fn restore_db_backup(
     // Defense-in-depth (parity with delete_db_backup, which guards this): reject any
     // traversal in the stored db_name/filename before composing the agent path. Both
     // come from server-generated rows today, but keep restore and delete symmetric.
-    if backup.filename.contains('/') || backup.filename.contains("..") || backup.filename.contains('\0')
-        || backup.db_name.contains('/') || backup.db_name.contains("..") || backup.db_name.contains('\0') {
+    if backup.filename.contains('/')
+        || backup.filename.contains("..")
+        || backup.filename.contains('\0')
+        || backup.db_name.contains('/')
+        || backup.db_name.contains("..")
+        || backup.db_name.contains('\0')
+    {
         return Err(err(StatusCode::BAD_REQUEST, "Invalid backup path"));
     }
 
@@ -1174,16 +1331,28 @@ pub async fn restore_db_backup(
     // SUCCEEDING inside the container. The operator was told their restore failed, on a
     // path whose whole purpose is disaster recovery.
     let result = agent
-        .post_long(&agent_path, Some(body), crate::services::agent::DB_RESTORE_TIMEOUT_SECS)
+        .post_long(
+            &agent_path,
+            Some(body),
+            crate::services::agent::DB_RESTORE_TIMEOUT_SECS,
+        )
         .await
         .map_err(|e| agent_error("Database restore", e))?;
 
     let ip = crate::routes::client_ip(&headers);
 
     activity::log_activity(
-        &state.db, claims.sub, &claims.email, "db_backup.restore",
-        Some("database"), Some(&backup.db_name), Some(&backup.filename), ip.as_deref(), claims.key_id,
-    ).await;
+        &state.db,
+        claims.sub,
+        &claims.email,
+        "db_backup.restore",
+        Some("database"),
+        Some(&backup.db_name),
+        Some(&backup.filename),
+        ip.as_deref(),
+        claims.key_id,
+    )
+    .await;
 
     crate::services::security_hardening::audit_log(
         &state.db,
@@ -1196,11 +1365,16 @@ pub async fn restore_db_backup(
         None,
         "info",
         claims.key_id,
-    ).await;
+    )
+    .await;
 
-    fire_event(&state.db, "db_backup.restored", serde_json::json!({
-        "database": &backup.db_name, "filename": &backup.filename, "backup_id": id.to_string(),
-    }));
+    fire_event(
+        &state.db,
+        "db_backup.restored",
+        serde_json::json!({
+            "database": &backup.db_name, "filename": &backup.filename, "backup_id": id.to_string(),
+        }),
+    );
 
     Ok(Json(result))
 }
@@ -1222,10 +1396,18 @@ pub async fn create_volume_backup(
     Json(req): Json<CreateVolumeBackupRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
     // Validate container/volume names to prevent path traversal in agent URLs
-    if req.container_name.contains('/') || req.container_name.contains("..") || req.container_name.contains('\0') || req.container_name.len() > 128 {
+    if req.container_name.contains('/')
+        || req.container_name.contains("..")
+        || req.container_name.contains('\0')
+        || req.container_name.len() > 128
+    {
         return Err(err(StatusCode::BAD_REQUEST, "Invalid container name"));
     }
-    if req.volume_name.contains('/') || req.volume_name.contains("..") || req.volume_name.contains('\0') || req.volume_name.len() > 128 {
+    if req.volume_name.contains('/')
+        || req.volume_name.contains("..")
+        || req.volume_name.contains('\0')
+        || req.volume_name.len() > 128
+    {
         return Err(err(StatusCode::BAD_REQUEST, "Invalid volume name"));
     }
 
@@ -1234,11 +1416,20 @@ pub async fn create_volume_backup(
         "container_name": req.container_name,
     });
 
-    let result = agent.post("/volume-backups/create", Some(body)).await
+    let result = agent
+        .post("/volume-backups/create", Some(body))
+        .await
         .map_err(|e| agent_error("Volume backup", e))?;
 
-    let filename = result.get("filename").and_then(|v| v.as_str()).unwrap_or("").to_string();
-    let size_bytes = result.get("size_bytes").and_then(|v| v.as_u64()).unwrap_or(0) as i64;
+    let filename = result
+        .get("filename")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let size_bytes = result
+        .get("size_bytes")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as i64;
 
     // The row records the server the archive was actually written on, which is the
     // one `ServerScope` just resolved the agent for — NOT "some online server".
@@ -1249,7 +1440,11 @@ pub async fn create_volume_backup(
 
     // v2.8.2: integrity chain. Scope previous_hash by (container_id, volume_name)
     // so re-creating the same logical volume re-chains rather than forking.
-    let sha256_hash = result.get("sha256").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let sha256_hash = result
+        .get("sha256")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
     let previous_hash: Option<String> = sqlx::query_scalar::<_, Option<String>>(
         "SELECT sha256_hash FROM volume_backups WHERE container_id = $1 AND volume_name = $2 ORDER BY created_at DESC LIMIT 1"
     ).bind(&req.container_id).bind(&req.volume_name).fetch_optional(&state.db).await.unwrap_or(None).flatten();
@@ -1266,15 +1461,26 @@ pub async fn create_volume_backup(
     .map_err(|e| internal_error("create volume backup", e))?;
 
     activity::log_activity(
-        &state.db, claims.sub, &claims.email, "volume_backup.create",
-        Some("volume"), Some(&req.container_name), Some(&filename), None, claims.key_id,
-    ).await;
+        &state.db,
+        claims.sub,
+        &claims.email,
+        "volume_backup.create",
+        Some("volume"),
+        Some(&req.container_name),
+        Some(&filename),
+        None,
+        claims.key_id,
+    )
+    .await;
 
-    Ok((StatusCode::CREATED, Json(serde_json::json!({
-        "id": backup.id,
-        "filename": filename,
-        "size_bytes": size_bytes,
-    }))))
+    Ok((
+        StatusCode::CREATED,
+        Json(serde_json::json!({
+            "id": backup.id,
+            "filename": filename,
+            "size_bytes": size_bytes,
+        })),
+    ))
 }
 
 /// GET /api/backup-orchestrator/volume-backups — List volume backups.
@@ -1297,10 +1503,13 @@ pub async fn list_volume_backups(
     let backups: Vec<VolumeBackup> = sqlx::query_as(
         "SELECT vb.* FROM volume_backups vb \
          JOIN servers sv ON sv.id = vb.server_id AND (sv.is_local OR sv.user_id = $1) \
-         ORDER BY vb.created_at DESC LIMIT $2 OFFSET $3"
+         ORDER BY vb.created_at DESC LIMIT $2 OFFSET $3",
     )
-    .bind(claims.sub).bind(limit).bind(offset)
-    .fetch_all(&state.db).await
+    .bind(claims.sub)
+    .bind(limit)
+    .bind(offset)
+    .fetch_all(&state.db)
+    .await
     .map_err(|e| internal_error("list volume backups", e))?;
 
     Ok(Json(backups))
@@ -1337,11 +1546,12 @@ pub async fn restore_volume_backup(
     let backup: Option<VolumeBackup> = sqlx::query_as(
         "SELECT * FROM volume_backups vb WHERE vb.id = $1 AND EXISTS (\
              SELECT 1 FROM users u, servers sv WHERE u.id = $2 AND u.role = 'admin' \
-             AND sv.id = vb.server_id AND (sv.is_local OR sv.user_id = u.id))"
+             AND sv.id = vb.server_id AND (sv.is_local OR sv.user_id = u.id))",
     )
     .bind(id)
     .bind(claims.sub)
-    .fetch_optional(&state.db).await
+    .fetch_optional(&state.db)
+    .await
     .map_err(|e| internal_error("restore volume backup", e))?;
 
     let backup = backup.ok_or_else(|| err(StatusCode::NOT_FOUND, "Volume backup not found"))?;
@@ -1358,8 +1568,11 @@ pub async fn restore_volume_backup(
     // here is a row written before the fleet backfill; refusing it is correct, because
     // there is no safe guess about which machine's volume to overwrite.
     let agent = crate::helpers::agent_for_site_server(
-        &state, backup.server_id, &format!("volume {}", backup.volume_name),
-    ).await?;
+        &state,
+        backup.server_id,
+        &format!("volume {}", backup.volume_name),
+    )
+    .await?;
 
     // Call agent to restore volume.
     //
@@ -1376,19 +1589,32 @@ pub async fn restore_volume_backup(
     // The volume drill cannot catch this: `services/backup_drill.rs` re-implements
     // the restore rather than calling this path, so a green drill says nothing
     // about whether the real restore runs.
-    let agent_path = format!("/volume-backups/{}/restore/{}", backup.container_name, backup.filename);
-    let result = agent.post(
-        &agent_path,
-        Some(serde_json::json!({ "volume_name": backup.volume_name })),
-    ).await
+    let agent_path = format!(
+        "/volume-backups/{}/restore/{}",
+        backup.container_name, backup.filename
+    );
+    let result = agent
+        .post(
+            &agent_path,
+            Some(serde_json::json!({ "volume_name": backup.volume_name })),
+        )
+        .await
         .map_err(|e| agent_error("Volume restore", e))?;
 
     let ip = crate::routes::client_ip(&headers);
 
     activity::log_activity(
-        &state.db, claims.sub, &claims.email, "volume_backup.restore",
-        Some("volume"), Some(&backup.container_name), Some(&backup.filename), ip.as_deref(), claims.key_id,
-    ).await;
+        &state.db,
+        claims.sub,
+        &claims.email,
+        "volume_backup.restore",
+        Some("volume"),
+        Some(&backup.container_name),
+        Some(&backup.filename),
+        ip.as_deref(),
+        claims.key_id,
+    )
+    .await;
 
     crate::services::security_hardening::audit_log(
         &state.db,
@@ -1401,12 +1627,17 @@ pub async fn restore_volume_backup(
         None,
         "info",
         claims.key_id,
-    ).await;
+    )
+    .await;
 
-    fire_event(&state.db, "volume_backup.restored", serde_json::json!({
-        "container_name": &backup.container_name, "volume_name": &backup.volume_name,
-        "filename": &backup.filename, "backup_id": id.to_string(),
-    }));
+    fire_event(
+        &state.db,
+        "volume_backup.restored",
+        serde_json::json!({
+            "container_name": &backup.container_name, "volume_name": &backup.volume_name,
+            "filename": &backup.filename, "backup_id": id.to_string(),
+        }),
+    );
 
     Ok(Json(result))
 }
@@ -1441,7 +1672,9 @@ async fn agent_for_backup(
     // `backups` carries no server_id of its own — a site backup reaches its host through
     // the site, the same hop the unified list and the SLA queries above already make.
     let sql = match backup_type {
-        "site" => "SELECT s.server_id FROM backups b JOIN sites s ON s.id = b.site_id WHERE b.id = $1",
+        "site" => {
+            "SELECT s.server_id FROM backups b JOIN sites s ON s.id = b.site_id WHERE b.id = $1"
+        }
         "database" => "SELECT server_id FROM database_backups WHERE id = $1",
         "volume" => "SELECT server_id FROM volume_backups WHERE id = $1",
         _ => return Err(err(StatusCode::BAD_REQUEST, "Invalid backup type")),
@@ -1449,13 +1682,17 @@ async fn agent_for_backup(
 
     let server_id: Option<Uuid> = sqlx::query_scalar::<_, Option<Uuid>>(sql)
         .bind(backup_id)
-        .fetch_optional(&state.db).await
+        .fetch_optional(&state.db)
+        .await
         .map_err(|e| internal_error("resolve backup host", e))?
         .ok_or_else(|| err(StatusCode::NOT_FOUND, "Backup not found"))?;
 
     let agent = crate::helpers::agent_for_site_server(
-        state, server_id, &format!("{backup_type} backup {backup_id}"),
-    ).await?;
+        state,
+        server_id,
+        &format!("{backup_type} backup {backup_id}"),
+    )
+    .await?;
     Ok((server_id, agent))
 }
 
@@ -1468,7 +1705,7 @@ pub struct VerifyRequest {
 /// POST /api/backup-orchestrator/verify — Trigger backup verification.
 pub async fn trigger_verify(
     State(state): State<AppState>,
-    AdminUser(_claims): AdminUser,
+    AdminUser(claims): AdminUser,
     Json(req): Json<VerifyRequest>,
 ) -> Result<(StatusCode, Json<BackupVerification>), ApiError> {
     // Read the archive on the host that holds it, resolved from the backup's own row.
@@ -1489,20 +1726,25 @@ pub async fn trigger_verify(
     // field for it.
     let verification: BackupVerification = sqlx::query_as(
         "INSERT INTO backup_verifications (backup_type, backup_id, server_id, status, started_at) \
-         VALUES ($1, $2, $3, 'running', NOW()) RETURNING *"
+         VALUES ($1, $2, $3, 'running', NOW()) RETURNING *",
     )
-    .bind(&req.backup_type).bind(req.backup_id).bind(server_id)
-    .fetch_one(&state.db).await
+    .bind(&req.backup_type)
+    .bind(req.backup_id)
+    .bind(server_id)
+    .fetch_one(&state.db)
+    .await
     .map_err(|e| internal_error("trigger verify", e))?;
 
     let verif_id = verification.id;
     let db = state.db.clone();
     let backup_type = req.backup_type.clone();
     let backup_id = req.backup_id;
+    let user_id = claims.sub;
 
     // Run verification async
     tokio::spawn(async move {
-        let result: Result<serde_json::Value, String> = match backup_type.as_str() {
+        let result: Result<(serde_json::Value, String, String), String> = match backup_type.as_str()
+        {
             "site" => {
                 let row = sqlx::query_as::<_, (String, String)>(
                     "SELECT s.domain, b.filename FROM backups b JOIN sites s ON s.id = b.site_id WHERE b.id = $1"
@@ -1510,8 +1752,14 @@ pub async fn trigger_verify(
 
                 match row {
                     Ok(Some((domain, filename))) => {
-                        let body = serde_json::json!({ "domain": domain, "filename": filename });
-                        agent.post("/backups/verify/site", Some(body)).await.map_err(|e| e.to_string())
+                        let body = serde_json::json!({ "domain": &domain, "filename": &filename });
+                        crate::services::backup_verifier::post_verification_with_retry(
+                            &agent,
+                            "/backups/verify/site",
+                            body,
+                        )
+                        .await
+                        .map(|data| (data, domain, filename))
                     }
                     Ok(None) => Err("Backup not found".to_string()),
                     Err(e) => {
@@ -1522,13 +1770,22 @@ pub async fn trigger_verify(
             }
             "database" => {
                 let row = sqlx::query_as::<_, (String, String, String)>(
-                    "SELECT db_type, db_name, filename FROM database_backups WHERE id = $1"
-                ).bind(backup_id).fetch_optional(&db).await;
+                    "SELECT db_type, db_name, filename FROM database_backups WHERE id = $1",
+                )
+                .bind(backup_id)
+                .fetch_optional(&db)
+                .await;
 
                 match row {
                     Ok(Some((db_type, db_name, filename))) => {
-                        let body = serde_json::json!({ "db_type": db_type, "db_name": db_name, "filename": filename });
-                        agent.post("/backups/verify/database", Some(body)).await.map_err(|e| e.to_string())
+                        let body = serde_json::json!({ "db_type": &db_type, "db_name": &db_name, "filename": &filename });
+                        crate::services::backup_verifier::post_verification_with_retry(
+                            &agent,
+                            "/backups/verify/database",
+                            body,
+                        )
+                        .await
+                        .map(|data| (data, db_name, filename))
                     }
                     Ok(None) => Err("Database backup not found".to_string()),
                     Err(e) => {
@@ -1539,13 +1796,22 @@ pub async fn trigger_verify(
             }
             "volume" => {
                 let row = sqlx::query_as::<_, (String, String)>(
-                    "SELECT container_name, filename FROM volume_backups WHERE id = $1"
-                ).bind(backup_id).fetch_optional(&db).await;
+                    "SELECT container_name, filename FROM volume_backups WHERE id = $1",
+                )
+                .bind(backup_id)
+                .fetch_optional(&db)
+                .await;
 
                 match row {
                     Ok(Some((container_name, filename))) => {
-                        let body = serde_json::json!({ "container_name": container_name, "filename": filename });
-                        agent.post("/backups/verify/volume", Some(body)).await.map_err(|e| e.to_string())
+                        let body = serde_json::json!({ "container_name": &container_name, "filename": &filename });
+                        crate::services::backup_verifier::post_verification_with_retry(
+                            &agent,
+                            "/backups/verify/volume",
+                            body,
+                        )
+                        .await
+                        .map(|data| (data, container_name, filename))
                     }
                     Ok(None) => Err("Volume backup not found".to_string()),
                     Err(e) => {
@@ -1558,24 +1824,41 @@ pub async fn trigger_verify(
         };
 
         match result {
-            Ok(data) => {
-                let passed = data.get("passed").and_then(|v| v.as_bool()).unwrap_or(false);
-                let checks_run = data.get("checks_run").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
-                let checks_passed = data.get("checks_passed").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
-                let duration_ms = data.get("duration_ms").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
-                let details = data.get("details").cloned().unwrap_or(serde_json::json!([]));
+            Ok((data, name, filename)) => {
+                let outcome =
+                    crate::services::backup_verifier::VerificationOutcome::from_agent_response(
+                        &data,
+                    );
 
                 let _ = sqlx::query(
                     "UPDATE backup_verifications SET \
                      status = $2, checks_run = $3, checks_passed = $4, \
-                     details = $5, duration_ms = $6, completed_at = NOW() \
-                     WHERE id = $1"
+                     details = $5, duration_ms = $6, error_message = $7, completed_at = NOW() \
+                     WHERE id = $1",
                 )
                 .bind(verif_id)
-                .bind(if passed { "passed" } else { "failed" })
-                .bind(checks_run).bind(checks_passed)
-                .bind(details).bind(duration_ms)
-                .execute(&db).await;
+                .bind(if outcome.passed { "passed" } else { "failed" })
+                .bind(outcome.checks_run)
+                .bind(outcome.checks_passed)
+                .bind(&outcome.details)
+                .bind(outcome.duration_ms)
+                .bind(&outcome.error_message)
+                .execute(&db)
+                .await;
+
+                crate::services::backup_verifier::reconcile_verification_alert(
+                    &db,
+                    user_id,
+                    &backup_type,
+                    backup_id,
+                    &name,
+                    &filename,
+                    outcome.passed,
+                    outcome.checks_passed,
+                    outcome.checks_run,
+                    outcome.error_message.as_deref(),
+                )
+                .await;
             }
             Err(e) => {
                 let _ = sqlx::query(
@@ -1598,9 +1881,10 @@ pub async fn storage_history(
         "SELECT DATE(created_at)::TEXT as day, message \
          FROM system_logs \
          WHERE source = 'backup_storage' AND created_at > NOW() - INTERVAL '30 days' \
-         ORDER BY created_at ASC"
+         ORDER BY created_at ASC",
     )
-    .fetch_all(&state.db).await
+    .fetch_all(&state.db)
+    .await
     .map_err(|e| internal_error("storage history", e))?;
 
     // Group by day, keep the last reading per day
@@ -1611,12 +1895,15 @@ pub async fn storage_history(
         }
     }
 
-    let result: Vec<serde_json::Value> = daily.into_iter()
-        .map(|(day, bytes)| serde_json::json!({
-            "date": day,
-            "total_bytes": bytes,
-            "total_mb": (bytes as f64 / 1_048_576.0).round() as i64,
-        }))
+    let result: Vec<serde_json::Value> = daily
+        .into_iter()
+        .map(|(day, bytes)| {
+            serde_json::json!({
+                "date": day,
+                "total_bytes": bytes,
+                "total_mb": (bytes as f64 / 1_048_576.0).round() as i64,
+            })
+        })
         .collect();
 
     Ok(Json(result))
@@ -1631,10 +1918,12 @@ pub async fn list_verifications(
     let (limit, offset) = paginate(params.limit, params.offset);
 
     let verifications: Vec<BackupVerification> = sqlx::query_as(
-        "SELECT * FROM backup_verifications ORDER BY created_at DESC LIMIT $1 OFFSET $2"
+        "SELECT * FROM backup_verifications ORDER BY created_at DESC LIMIT $1 OFFSET $2",
     )
-    .bind(limit).bind(offset)
-    .fetch_all(&state.db).await
+    .bind(limit)
+    .bind(offset)
+    .fetch_all(&state.db)
+    .await
     .map_err(|e| internal_error("list verifications", e))?;
 
     Ok(Json(verifications))
@@ -1701,13 +1990,23 @@ pub async fn trigger_drill(
             "site" => {
                 let row = sqlx::query_as::<_, (String, String)>(
                     "SELECT s.domain, b.filename FROM backups b \
-                     JOIN sites s ON s.id = b.site_id WHERE b.id = $1"
-                ).bind(backup_id).fetch_optional(&db).await;
+                     JOIN sites s ON s.id = b.site_id WHERE b.id = $1",
+                )
+                .bind(backup_id)
+                .fetch_optional(&db)
+                .await;
 
                 match row {
                     Ok(Some((domain, filename))) => {
                         let body = serde_json::json!({ "domain": domain, "filename": filename });
-                        agent.post_long("/backups/drill/site", Some(body), crate::services::agent::DRILL_TIMEOUT_SECS).await.map_err(|e| e.to_string())
+                        agent
+                            .post_long(
+                                "/backups/drill/site",
+                                Some(body),
+                                crate::services::agent::DRILL_TIMEOUT_SECS,
+                            )
+                            .await
+                            .map_err(|e| e.to_string())
                     }
                     Ok(None) => Err("Site backup not found".to_string()),
                     Err(e) => {
@@ -1718,8 +2017,11 @@ pub async fn trigger_drill(
             }
             "database" => {
                 let row = sqlx::query_as::<_, (String, String, String)>(
-                    "SELECT db_type, db_name, filename FROM database_backups WHERE id = $1"
-                ).bind(backup_id).fetch_optional(&db).await;
+                    "SELECT db_type, db_name, filename FROM database_backups WHERE id = $1",
+                )
+                .bind(backup_id)
+                .fetch_optional(&db)
+                .await;
 
                 match row {
                     Ok(Some((db_type, db_name, filename))) => {
@@ -1728,7 +2030,14 @@ pub async fn trigger_drill(
                             "db_name": db_name,
                             "filename": filename,
                         });
-                        agent.post_long("/backups/drill/db", Some(body), crate::services::agent::DRILL_TIMEOUT_SECS).await.map_err(|e| e.to_string())
+                        agent
+                            .post_long(
+                                "/backups/drill/db",
+                                Some(body),
+                                crate::services::agent::DRILL_TIMEOUT_SECS,
+                            )
+                            .await
+                            .map_err(|e| e.to_string())
                     }
                     Ok(None) => Err("Database backup not found".to_string()),
                     Err(e) => {
@@ -1739,8 +2048,11 @@ pub async fn trigger_drill(
             }
             "volume" => {
                 let row = sqlx::query_as::<_, (String, String)>(
-                    "SELECT container_name, filename FROM volume_backups WHERE id = $1"
-                ).bind(backup_id).fetch_optional(&db).await;
+                    "SELECT container_name, filename FROM volume_backups WHERE id = $1",
+                )
+                .bind(backup_id)
+                .fetch_optional(&db)
+                .await;
 
                 match row {
                     Ok(Some((container_name, filename))) => {
@@ -1748,7 +2060,14 @@ pub async fn trigger_drill(
                             "container_name": container_name,
                             "filename": filename,
                         });
-                        agent.post_long("/backups/drill/volume", Some(body), crate::services::agent::DRILL_TIMEOUT_SECS).await.map_err(|e| e.to_string())
+                        agent
+                            .post_long(
+                                "/backups/drill/volume",
+                                Some(body),
+                                crate::services::agent::DRILL_TIMEOUT_SECS,
+                            )
+                            .await
+                            .map_err(|e| e.to_string())
                     }
                     Ok(None) => Err("Volume backup not found".to_string()),
                     Err(e) => {
@@ -1762,23 +2081,41 @@ pub async fn trigger_drill(
 
         match result {
             Ok(data) => {
-                let passed = data.get("passed").and_then(|v| v.as_bool()).unwrap_or(false);
-                let http_status = data.get("http_status").and_then(|v| v.as_i64()).map(|n| n as i32);
-                let body_excerpt = data.get("body_excerpt").and_then(|v| v.as_str()).map(|s| s.to_string());
-                let error_message = data.get("error_message").and_then(|v| v.as_str()).map(|s| s.to_string());
-                let duration_ms = data.get("duration_ms").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
+                let passed = data
+                    .get("passed")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let http_status = data
+                    .get("http_status")
+                    .and_then(|v| v.as_i64())
+                    .map(|n| n as i32);
+                let body_excerpt = data
+                    .get("body_excerpt")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+                let error_message = data
+                    .get("error_message")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+                let duration_ms = data
+                    .get("duration_ms")
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0) as i32;
 
                 let _ = sqlx::query(
                     "UPDATE backup_drills SET \
                      status = $2, http_status = $3, body_excerpt = $4, \
                      error_message = $5, duration_ms = $6, completed_at = NOW() \
-                     WHERE id = $1"
+                     WHERE id = $1",
                 )
                 .bind(drill_id)
                 .bind(if passed { "passed" } else { "failed" })
-                .bind(http_status).bind(body_excerpt)
-                .bind(error_message).bind(duration_ms)
-                .execute(&db).await;
+                .bind(http_status)
+                .bind(body_excerpt)
+                .bind(error_message)
+                .bind(duration_ms)
+                .execute(&db)
+                .await;
             }
             Err(e) => {
                 let _ = sqlx::query(
@@ -1805,15 +2142,17 @@ pub async fn list_drills(
 ) -> Result<Json<DrillsResponse>, ApiError> {
     let (limit, offset) = paginate(params.limit, params.offset);
 
-    let items: Vec<BackupDrill> = sqlx::query_as(
-        "SELECT * FROM backup_drills ORDER BY created_at DESC LIMIT $1 OFFSET $2"
-    )
-    .bind(limit).bind(offset)
-    .fetch_all(&state.db).await
-    .map_err(|e| internal_error("list drills", e))?;
+    let items: Vec<BackupDrill> =
+        sqlx::query_as("SELECT * FROM backup_drills ORDER BY created_at DESC LIMIT $1 OFFSET $2")
+            .bind(limit)
+            .bind(offset)
+            .fetch_all(&state.db)
+            .await
+            .map_err(|e| internal_error("list drills", e))?;
 
     let (total,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM backup_drills")
-        .fetch_one(&state.db).await
+        .fetch_one(&state.db)
+        .await
         .map_err(|e| internal_error("list drills count", e))?;
 
     Ok(Json(DrillsResponse { items, total }))
@@ -1904,7 +2243,10 @@ fn parse_chain_kind(kind: &str) -> Result<&'static str, ApiError> {
         "site" => Ok("site"),
         "database" => Ok("database"),
         "volume" => Ok("volume"),
-        _ => Err(err(StatusCode::BAD_REQUEST, "kind must be one of: site, database, volume")),
+        _ => Err(err(
+            StatusCode::BAD_REQUEST,
+            "kind must be one of: site, database, volume",
+        )),
     }
 }
 
@@ -1933,61 +2275,103 @@ async fn build_chain_report(
     let backup = match kind {
         "site" => {
             let row: Option<(
-                Uuid, Uuid, String, String, i64,
-                Option<String>, Option<String>,
+                Uuid,
+                Uuid,
+                String,
+                String,
+                i64,
+                Option<String>,
+                Option<String>,
                 chrono::DateTime<chrono::Utc>,
             )> = sqlx::query_as(
                 "SELECT b.id, b.site_id, s.domain, b.filename, b.size_bytes, \
                         b.sha256_hash, b.previous_hash, b.created_at \
                    FROM backups b JOIN sites s ON s.id = b.site_id \
                    JOIN servers sv ON sv.id = s.server_id AND (sv.is_local OR sv.user_id = $2) \
-                  WHERE b.id = $1"
+                  WHERE b.id = $1",
             )
             .bind(backup_id)
             .bind(caller_id)
-            .fetch_optional(&state.db).await
+            .fetch_optional(&state.db)
+            .await
             .map_err(|e| internal_error("chain report: load site backup", e))?;
 
-            let (id, site_id, resource_name, filename, size_bytes, sha256_hash, previous_hash, created_at) =
-                row.ok_or_else(|| err(StatusCode::NOT_FOUND, "Backup not found"))?;
+            let (
+                id,
+                site_id,
+                resource_name,
+                filename,
+                size_bytes,
+                sha256_hash,
+                previous_hash,
+                created_at,
+            ) = row.ok_or_else(|| err(StatusCode::NOT_FOUND, "Backup not found"))?;
 
             ChainReportBackup {
                 kind: "site".into(),
-                id, resource_name, filename, size_bytes,
-                sha256_hash, previous_hash,
+                id,
+                resource_name,
+                filename,
+                size_bytes,
+                sha256_hash,
+                previous_hash,
                 created_at,
                 site_id: Some(site_id),
-                database_id: None, container_id: None, volume_name: None, db_type: None,
+                database_id: None,
+                container_id: None,
+                volume_name: None,
+                db_type: None,
             }
         }
         "database" => {
             let row: Option<(
-                Uuid, Uuid, String, String, String, i64,
-                Option<String>, Option<String>,
+                Uuid,
+                Uuid,
+                String,
+                String,
+                String,
+                i64,
+                Option<String>,
+                Option<String>,
                 chrono::DateTime<chrono::Utc>,
             )> = sqlx::query_as(
                 "SELECT db.id, db.database_id, db.db_name, db.db_type, db.filename, db.size_bytes, \
                         db.sha256_hash, db.previous_hash, db.created_at \
                    FROM database_backups db \
                    JOIN servers sv ON sv.id = db.server_id AND (sv.is_local OR sv.user_id = $2) \
-                  WHERE db.id = $1"
+                  WHERE db.id = $1",
             )
             .bind(backup_id)
             .bind(caller_id)
-            .fetch_optional(&state.db).await
+            .fetch_optional(&state.db)
+            .await
             .map_err(|e| internal_error("chain report: load database backup", e))?;
 
-            let (id, database_id, resource_name, db_type, filename, size_bytes, sha256_hash, previous_hash, created_at) =
-                row.ok_or_else(|| err(StatusCode::NOT_FOUND, "Backup not found"))?;
+            let (
+                id,
+                database_id,
+                resource_name,
+                db_type,
+                filename,
+                size_bytes,
+                sha256_hash,
+                previous_hash,
+                created_at,
+            ) = row.ok_or_else(|| err(StatusCode::NOT_FOUND, "Backup not found"))?;
 
             ChainReportBackup {
                 kind: "database".into(),
-                id, resource_name, filename, size_bytes,
-                sha256_hash, previous_hash,
+                id,
+                resource_name,
+                filename,
+                size_bytes,
+                sha256_hash,
+                previous_hash,
                 created_at,
                 site_id: None,
                 database_id: Some(database_id),
-                container_id: None, volume_name: None,
+                container_id: None,
+                volume_name: None,
                 db_type: Some(db_type),
             }
         }
@@ -2008,17 +2392,29 @@ async fn build_chain_report(
             .fetch_optional(&state.db).await
             .map_err(|e| internal_error("chain report: load volume backup", e))?;
 
-            let (id, container_id, container_name, volume_name, filename, size_bytes, sha256_hash, previous_hash, created_at) =
-                row.ok_or_else(|| err(StatusCode::NOT_FOUND, "Backup not found"))?;
+            let (
+                id,
+                container_id,
+                container_name,
+                volume_name,
+                filename,
+                size_bytes,
+                sha256_hash,
+                previous_hash,
+                created_at,
+            ) = row.ok_or_else(|| err(StatusCode::NOT_FOUND, "Backup not found"))?;
 
             ChainReportBackup {
                 kind: "volume".into(),
                 id,
                 resource_name: format!("{container_name}:{volume_name}"),
-                filename, size_bytes,
-                sha256_hash, previous_hash,
+                filename,
+                size_bytes,
+                sha256_hash,
+                previous_hash,
                 created_at,
-                site_id: None, database_id: None,
+                site_id: None,
+                database_id: None,
                 container_id: Some(container_id),
                 volume_name: Some(volume_name),
                 db_type: None,
@@ -2029,7 +2425,11 @@ async fn build_chain_report(
     };
 
     let verifications_rows: Vec<(
-        Uuid, String, i32, i32, Option<i32>,
+        Uuid,
+        String,
+        i32,
+        i32,
+        Option<i32>,
         Option<chrono::DateTime<chrono::Utc>>,
         Option<chrono::DateTime<chrono::Utc>>,
         chrono::DateTime<chrono::Utc>,
@@ -2039,15 +2439,20 @@ async fn build_chain_report(
                 started_at, completed_at, created_at, error_message \
            FROM backup_verifications \
           WHERE backup_type = $1 AND backup_id = $2 \
-          ORDER BY created_at ASC"
+          ORDER BY created_at ASC",
     )
     .bind(kind)
     .bind(backup_id)
-    .fetch_all(&state.db).await
+    .fetch_all(&state.db)
+    .await
     .map_err(|e| internal_error("chain report: load verifications", e))?;
 
     let drills_rows: Vec<(
-        Uuid, String, Option<i32>, Option<String>, Option<i32>,
+        Uuid,
+        String,
+        Option<i32>,
+        Option<String>,
+        Option<i32>,
         Option<chrono::DateTime<chrono::Utc>>,
         Option<chrono::DateTime<chrono::Utc>>,
         chrono::DateTime<chrono::Utc>,
@@ -2057,32 +2462,76 @@ async fn build_chain_report(
                 started_at, completed_at, created_at, error_message \
            FROM backup_drills \
           WHERE backup_type = $1 AND backup_id = $2 \
-          ORDER BY created_at ASC"
+          ORDER BY created_at ASC",
     )
     .bind(kind)
     .bind(backup_id)
-    .fetch_all(&state.db).await
+    .fetch_all(&state.db)
+    .await
     .map_err(|e| internal_error("chain report: load drills", e))?;
 
-    let verifications: Vec<ChainReportVerification> = verifications_rows.into_iter().map(
-        |(id, status, checks_run, checks_passed, duration_ms, started_at, completed_at, created_at, error_message)| {
-            ChainReportVerification {
-                id, status, checks_run, checks_passed, duration_ms,
-                started_at, completed_at, created_at, error_message,
-            }
-        }
-    ).collect();
+    let verifications: Vec<ChainReportVerification> = verifications_rows
+        .into_iter()
+        .map(
+            |(
+                id,
+                status,
+                checks_run,
+                checks_passed,
+                duration_ms,
+                started_at,
+                completed_at,
+                created_at,
+                error_message,
+            )| {
+                ChainReportVerification {
+                    id,
+                    status,
+                    checks_run,
+                    checks_passed,
+                    duration_ms,
+                    started_at,
+                    completed_at,
+                    created_at,
+                    error_message,
+                }
+            },
+        )
+        .collect();
 
-    let drills: Vec<ChainReportDrill> = drills_rows.into_iter().map(
-        |(id, status, http_status, body_excerpt, duration_ms, started_at, completed_at, created_at, error_message)| {
-            ChainReportDrill {
-                id, status, http_status, body_excerpt, duration_ms,
-                started_at, completed_at, created_at, error_message,
-            }
-        }
-    ).collect();
+    let drills: Vec<ChainReportDrill> = drills_rows
+        .into_iter()
+        .map(
+            |(
+                id,
+                status,
+                http_status,
+                body_excerpt,
+                duration_ms,
+                started_at,
+                completed_at,
+                created_at,
+                error_message,
+            )| {
+                ChainReportDrill {
+                    id,
+                    status,
+                    http_status,
+                    body_excerpt,
+                    duration_ms,
+                    started_at,
+                    completed_at,
+                    created_at,
+                    error_message,
+                }
+            },
+        )
+        .collect();
 
-    let verifications_passed = verifications.iter().filter(|v| v.status == "passed").count() as i64;
+    let verifications_passed = verifications
+        .iter()
+        .filter(|v| v.status == "passed")
+        .count() as i64;
     let drills_passed = drills.iter().filter(|d| d.status == "passed").count() as i64;
     Ok(ChainReport {
         panel_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -2143,14 +2592,17 @@ pub async fn chain_report_pdf(
 ) -> Result<axum::response::Response, ApiError> {
     let kind = parse_chain_kind(&kind)?;
     let report = build_chain_report(&state, kind, id, claims.sub).await?;
-    let json_value = serde_json::to_value(&report)
-        .map_err(|e| internal_error("chain report: serialize", e))?;
+    let json_value =
+        serde_json::to_value(&report).map_err(|e| internal_error("chain report: serialize", e))?;
 
     let pdf = crate::services::chain_report::render_chain_report_pdf(&json_value)
         .await
         .map_err(|e| {
             tracing::warn!("chain report pdf render failed: {e}");
-            err(StatusCode::SERVICE_UNAVAILABLE, &format!("PDF generation failed: {e}"))
+            err(
+                StatusCode::SERVICE_UNAVAILABLE,
+                &format!("PDF generation failed: {e}"),
+            )
         })?;
 
     let filename = format!(

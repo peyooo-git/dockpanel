@@ -4,13 +4,205 @@ use uuid::Uuid;
 use crate::services::agent::AgentRegistry;
 use crate::services::notifications;
 
+const MAX_LIVE_ATTEMPTS: usize = 2;
+const MAX_RECORDED_FAILURES: i64 = 3;
+
+#[derive(Debug)]
+pub(crate) struct VerificationOutcome {
+    pub(crate) passed: bool,
+    pub(crate) checks_run: i32,
+    pub(crate) checks_passed: i32,
+    pub(crate) duration_ms: i32,
+    pub(crate) details: serde_json::Value,
+    pub(crate) error_message: Option<String>,
+}
+
+impl VerificationOutcome {
+    pub(crate) fn from_agent_response(data: &serde_json::Value) -> Self {
+        let passed = data
+            .get("passed")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let checks_run = data.get("checks_run").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
+        let checks_passed = data
+            .get("checks_passed")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0) as i32;
+        let duration_ms = data
+            .get("duration_ms")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0) as i32;
+        let details = data
+            .get("details")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!([]));
+        let error_message = (!passed)
+            .then(|| {
+                details
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter(|check| {
+                        !check
+                            .get("passed")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false)
+                    })
+                    .map(|check| {
+                        let name = check
+                            .get("name")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("check");
+                        let message = check
+                            .get("message")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("failed");
+                        format!("{name}: {message}")
+                    })
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            })
+            .filter(|message| !message.is_empty());
+
+        Self {
+            passed,
+            checks_run,
+            checks_passed,
+            duration_ms,
+            details,
+            error_message,
+        }
+    }
+}
+
+pub(crate) fn verification_state_key(backup_type: &str, backup_id: Uuid) -> String {
+    format!("{backup_type}:{backup_id}")
+}
+
+pub(crate) async fn post_verification_with_retry(
+    agent: &crate::services::agent::AgentHandle,
+    path: &str,
+    body: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    for attempt in 1..=MAX_LIVE_ATTEMPTS {
+        let response = agent
+            .post(path, Some(body.clone()))
+            .await
+            .map_err(|e| e.to_string());
+        let should_retry = match &response {
+            Ok(data) => !data
+                .get("passed")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+            Err(_) => true,
+        };
+
+        if !should_retry || attempt == MAX_LIVE_ATTEMPTS {
+            return response;
+        }
+
+        tracing::warn!(
+            "Backup verification attempt {attempt}/{MAX_LIVE_ATTEMPTS} failed on {path}; retrying once"
+        );
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    }
+
+    unreachable!("the verification retry loop always returns")
+}
+
+/// Keep one alert per archive and close it as soon as the same archive passes.
+/// Legacy rows used an empty key; migrate only the matching title before resolving
+/// so a recovery cannot hide a different failed backup.
+pub(crate) async fn reconcile_verification_alert(
+    db: &PgPool,
+    user_id: Uuid,
+    backup_type: &str,
+    backup_id: Uuid,
+    name: &str,
+    filename: &str,
+    passed: bool,
+    checks_passed: i32,
+    checks_run: i32,
+    error_message: Option<&str>,
+) {
+    let state_key = verification_state_key(backup_type, backup_id);
+    let failure_title = format!("Backup verification failed: {name}");
+
+    if passed {
+        if let Err(e) = sqlx::query(
+            "UPDATE alerts SET state_key = $3 \
+             WHERE user_id = $1 AND alert_type = 'backup_verification_failed' \
+             AND state_key = '' AND title = $2 AND status = 'firing'",
+        )
+        .bind(user_id)
+        .bind(&failure_title)
+        .bind(&state_key)
+        .execute(db)
+        .await
+        {
+            tracing::warn!("Failed to scope legacy backup verification alert: {e}");
+        }
+
+        notifications::resolve_alert(
+            db,
+            user_id,
+            None,
+            None,
+            "backup_verification_failed",
+            &state_key,
+            &format!("Backup verification recovered: {name}"),
+            &format!("The {backup_type} backup '{filename}' for {name} now passes verification."),
+        )
+        .await;
+        return;
+    }
+
+    let already_firing: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM alerts \
+         WHERE user_id = $1 AND alert_type = 'backup_verification_failed' \
+         AND state_key = $2 AND status = 'firing')",
+    )
+    .bind(user_id)
+    .bind(&state_key)
+    .fetch_one(db)
+    .await
+    .unwrap_or(false);
+
+    if already_firing {
+        return;
+    }
+
+    let detail = error_message
+        .map(|message| format!(" Reason: {message}."))
+        .unwrap_or_default();
+    notifications::fire_alert(
+        db,
+        user_id,
+        None,
+        None,
+        "backup_verification_failed",
+        &state_key,
+        "warning",
+        &failure_title,
+        &format!(
+            "The {backup_type} backup '{filename}' for {name} failed verification \
+             ({checks_passed}/{checks_run} checks passed).{detail}"
+        ),
+    )
+    .await;
+}
+
 /// Run the backup verifier — every 6 hours, picks unverified backups and verifies them.
 ///
 /// Every driving query is fleet-wide, so the verifier gets the REGISTRY: an archive is
 /// read on the host that wrote it. Verifying a member's backup against the panel's disk
 /// finds nothing, marks a good archive `failed`, and — because the driving queries skip
 /// any backup that already has a verification row — never looks at it again.
-pub async fn run(db: PgPool, agents: AgentRegistry, mut shutdown_rx: tokio::sync::broadcast::Receiver<()>) {
+pub async fn run(
+    db: PgPool,
+    agents: AgentRegistry,
+    mut shutdown_rx: tokio::sync::broadcast::Receiver<()>,
+) {
     tracing::info!("Backup verifier started");
 
     // Initial delay: 5 minutes after startup
@@ -42,15 +234,19 @@ pub async fn run(db: PgPool, agents: AgentRegistry, mut shutdown_rx: tokio::sync
 async fn tick(db: &PgPool, agents: &AgentRegistry) -> Result<(), String> {
     // Find policies that have verify_after_backup enabled
     let policies_exist: (i64,) = sqlx::query_as(
-        "SELECT COUNT(*) FROM backup_policies WHERE verify_after_backup = TRUE AND enabled = TRUE"
+        "SELECT COUNT(*) FROM backup_policies WHERE verify_after_backup = TRUE AND enabled = TRUE",
     )
-    .fetch_one(db).await.map_err(|e| e.to_string())?;
+    .fetch_one(db)
+    .await
+    .map_err(|e| e.to_string())?;
 
     if policies_exist.0 == 0 {
         return Ok(());
     }
 
-    // Pick up to 3 unverified site backups (created in last 7 days, not yet verified).
+    // Pick up to 3 site backups that have not passed yet. A failed row remains
+    // eligible for a bounded number of later cycles instead of permanently burning
+    // the archive's only verification attempt.
     // `s.server_id` rides the JOIN this query already makes — the same shape
     // `preview_cleanup` uses, and the reason no migration is needed for `backups`.
     // It is NOT NULL (20260319000000_multi_server.sql:76) and a site never moves
@@ -58,14 +254,25 @@ async fn tick(db: &PgPool, agents: &AgentRegistry) -> Result<(), String> {
     let site_backups: Vec<(Uuid, String, String, Uuid)> = sqlx::query_as(
         "SELECT b.id, s.domain, b.filename, s.server_id FROM backups b \
          JOIN sites s ON s.id = b.site_id \
-         LEFT JOIN backup_verifications bv ON bv.backup_type = 'site' AND bv.backup_id = b.id \
-         WHERE bv.id IS NULL AND b.created_at > NOW() - INTERVAL '7 days' \
-         ORDER BY b.created_at DESC LIMIT 3"
+         WHERE b.created_at > NOW() - INTERVAL '7 days' \
+         AND NOT EXISTS (SELECT 1 FROM backup_verifications bv \
+             WHERE bv.backup_type = 'site' AND bv.backup_id = b.id \
+             AND bv.status IN ('passed', 'running')) \
+         AND (SELECT COUNT(*) FROM backup_verifications bv \
+             WHERE bv.backup_type = 'site' AND bv.backup_id = b.id \
+             AND bv.status = 'failed') < $1 \
+         ORDER BY b.created_at DESC LIMIT 3",
     )
-    .fetch_all(db).await.map_err(|e| e.to_string())?;
+    .bind(MAX_RECORDED_FAILURES)
+    .fetch_all(db)
+    .await
+    .map_err(|e| e.to_string())?;
 
     for (backup_id, domain, filename, server_id) in &site_backups {
-        verify_one(db, agents, *server_id, "site", *backup_id, domain, filename, None, None).await;
+        verify_one(
+            db, agents, *server_id, "site", *backup_id, domain, filename, None, None,
+        )
+        .await;
     }
 
     // Database backups resolve their server through the site that owns the database,
@@ -76,14 +283,33 @@ async fn tick(db: &PgPool, agents: &AgentRegistry) -> Result<(), String> {
         "SELECT db.id, db.db_type, db.db_name, db.filename, s.server_id FROM database_backups db \
          JOIN databases d ON d.id = db.database_id \
          JOIN sites s ON s.id = d.site_id \
-         LEFT JOIN backup_verifications bv ON bv.backup_type = 'database' AND bv.backup_id = db.id \
-         WHERE bv.id IS NULL AND db.created_at > NOW() - INTERVAL '7 days' \
-         ORDER BY db.created_at DESC LIMIT 3"
+         WHERE db.created_at > NOW() - INTERVAL '7 days' \
+         AND NOT EXISTS (SELECT 1 FROM backup_verifications bv \
+             WHERE bv.backup_type = 'database' AND bv.backup_id = db.id \
+             AND bv.status IN ('passed', 'running')) \
+         AND (SELECT COUNT(*) FROM backup_verifications bv \
+             WHERE bv.backup_type = 'database' AND bv.backup_id = db.id \
+             AND bv.status = 'failed') < $1 \
+         ORDER BY db.created_at DESC LIMIT 3",
     )
-    .fetch_all(db).await.map_err(|e| e.to_string())?;
+    .bind(MAX_RECORDED_FAILURES)
+    .fetch_all(db)
+    .await
+    .map_err(|e| e.to_string())?;
 
     for (backup_id, db_type, db_name, filename, server_id) in &db_backups {
-        verify_one(db, agents, *server_id, "database", *backup_id, db_name, filename, Some(db_type), None).await;
+        verify_one(
+            db,
+            agents,
+            *server_id,
+            "database",
+            *backup_id,
+            db_name,
+            filename,
+            Some(db_type),
+            None,
+        )
+        .await;
     }
 
     // A volume backup has no site to join through, so `vb.server_id` is the only
@@ -92,11 +318,19 @@ async fn tick(db: &PgPool, agents: &AgentRegistry) -> Result<(), String> {
     // NULL id; NULL ones are skipped below rather than silently verified here.
     let vol_backups: Vec<(Uuid, String, String, Option<Uuid>)> = sqlx::query_as(
         "SELECT vb.id, vb.container_name, vb.filename, vb.server_id FROM volume_backups vb \
-         LEFT JOIN backup_verifications bv ON bv.backup_type = 'volume' AND bv.backup_id = vb.id \
-         WHERE bv.id IS NULL AND vb.created_at > NOW() - INTERVAL '7 days' \
-         ORDER BY vb.created_at DESC LIMIT 2"
+         WHERE vb.created_at > NOW() - INTERVAL '7 days' \
+         AND NOT EXISTS (SELECT 1 FROM backup_verifications bv \
+             WHERE bv.backup_type = 'volume' AND bv.backup_id = vb.id \
+             AND bv.status IN ('passed', 'running')) \
+         AND (SELECT COUNT(*) FROM backup_verifications bv \
+             WHERE bv.backup_type = 'volume' AND bv.backup_id = vb.id \
+             AND bv.status = 'failed') < $1 \
+         ORDER BY vb.created_at DESC LIMIT 2",
     )
-    .fetch_all(db).await.map_err(|e| e.to_string())?;
+    .bind(MAX_RECORDED_FAILURES)
+    .fetch_all(db)
+    .await
+    .map_err(|e| e.to_string())?;
 
     for (backup_id, container_name, filename, server_id) in &vol_backups {
         let Some(sid) = server_id else {
@@ -109,7 +343,18 @@ async fn tick(db: &PgPool, agents: &AgentRegistry) -> Result<(), String> {
             );
             continue;
         };
-        verify_one(db, agents, *sid, "volume", *backup_id, container_name, filename, None, Some(container_name.as_str())).await;
+        verify_one(
+            db,
+            agents,
+            *sid,
+            "volume",
+            *backup_id,
+            container_name,
+            filename,
+            None,
+            Some(container_name.as_str()),
+        )
+        .await;
     }
 
     // "considered", not "verified": a row whose server is unreachable is skipped
@@ -153,10 +398,14 @@ async fn verify_one(
     // `server_id` is bound: the row records which host actually read the archive.
     let verif_id: Uuid = match sqlx::query_scalar(
         "INSERT INTO backup_verifications (backup_type, backup_id, server_id, status, started_at) \
-         VALUES ($1, $2, $3, 'running', NOW()) RETURNING id"
+         VALUES ($1, $2, $3, 'running', NOW()) RETURNING id",
     )
-    .bind(backup_type).bind(backup_id).bind(server_id)
-    .fetch_one(db).await {
+    .bind(backup_type)
+    .bind(backup_id)
+    .bind(server_id)
+    .fetch_one(db)
+    .await
+    {
         Ok(id) => id,
         Err(e) => {
             tracing::error!("Failed to create verification record: {e}");
@@ -167,7 +416,7 @@ async fn verify_one(
     let result = match backup_type {
         "site" => {
             let body = serde_json::json!({ "domain": name, "filename": filename });
-            agent.post("/backups/verify/site", Some(body)).await
+            post_verification_with_retry(&agent, "/backups/verify/site", body).await
         }
         "database" => {
             let body = serde_json::json!({
@@ -175,50 +424,57 @@ async fn verify_one(
                 "db_name": name,
                 "filename": filename,
             });
-            agent.post("/backups/verify/database", Some(body)).await
+            post_verification_with_retry(&agent, "/backups/verify/database", body).await
         }
         "volume" => {
             let body = serde_json::json!({
                 "container_name": container_name.unwrap_or(name),
                 "filename": filename,
             });
-            agent.post("/backups/verify/volume", Some(body)).await
+            post_verification_with_retry(&agent, "/backups/verify/volume", body).await
         }
         _ => return,
     };
 
     match result {
         Ok(data) => {
-            let passed = data.get("passed").and_then(|v| v.as_bool()).unwrap_or(false);
-            let checks_run = data.get("checks_run").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
-            let checks_passed = data.get("checks_passed").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
-            let duration_ms = data.get("duration_ms").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
-            let details = data.get("details").cloned().unwrap_or(serde_json::json!([]));
-            let status = if passed { "passed" } else { "failed" };
+            let outcome = VerificationOutcome::from_agent_response(&data);
+            let status = if outcome.passed { "passed" } else { "failed" };
 
             let _ = sqlx::query(
                 "UPDATE backup_verifications SET \
                  status = $2, checks_run = $3, checks_passed = $4, \
-                 details = $5, duration_ms = $6, completed_at = NOW() \
-                 WHERE id = $1"
+                 details = $5, duration_ms = $6, error_message = $7, completed_at = NOW() \
+                 WHERE id = $1",
             )
-            .bind(verif_id).bind(status)
-            .bind(checks_run).bind(checks_passed)
-            .bind(details).bind(duration_ms)
-            .execute(db).await;
+            .bind(verif_id)
+            .bind(status)
+            .bind(outcome.checks_run)
+            .bind(outcome.checks_passed)
+            .bind(&outcome.details)
+            .bind(outcome.duration_ms)
+            .bind(&outcome.error_message)
+            .execute(db)
+            .await;
 
-            if !passed {
-                // Fire alert for failed verification
-                if let Ok(Some((user_id,))) = sqlx::query_as::<_, (Uuid,)>(
-                    "SELECT id FROM users WHERE role = 'admin' LIMIT 1"
-                ).fetch_optional(db).await {
-                    notifications::fire_alert(
-                        db, user_id, None, None,
-                        "backup_verification_failed", "", "warning",
-                        &format!("Backup verification failed: {name}"),
-                        &format!("The {backup_type} backup '{filename}' for {name} failed verification ({checks_passed}/{checks_run} checks passed)."),
-                    ).await;
-                }
+            if let Ok(Some((user_id,))) =
+                sqlx::query_as::<_, (Uuid,)>("SELECT id FROM users WHERE role = 'admin' LIMIT 1")
+                    .fetch_optional(db)
+                    .await
+            {
+                reconcile_verification_alert(
+                    db,
+                    user_id,
+                    backup_type,
+                    backup_id,
+                    name,
+                    filename,
+                    outcome.passed,
+                    outcome.checks_passed,
+                    outcome.checks_run,
+                    outcome.error_message.as_deref(),
+                )
+                .await;
             }
 
             tracing::info!("Verification {status}: {backup_type} backup {filename} for {name}");
@@ -229,7 +485,84 @@ async fn verify_one(
                 "UPDATE backup_verifications SET status = 'failed', error_message = $2, completed_at = NOW() WHERE id = $1"
             ).bind(verif_id).bind(&err_msg).execute(db).await;
 
+            if let Ok(Some((user_id,))) =
+                sqlx::query_as::<_, (Uuid,)>("SELECT id FROM users WHERE role = 'admin' LIMIT 1")
+                    .fetch_optional(db)
+                    .await
+            {
+                reconcile_verification_alert(
+                    db,
+                    user_id,
+                    backup_type,
+                    backup_id,
+                    name,
+                    filename,
+                    false,
+                    0,
+                    0,
+                    Some(&err_msg),
+                )
+                .await;
+            }
+
             tracing::error!("Verification failed for {backup_type} {filename}: {err_msg}");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{VerificationOutcome, verification_state_key};
+    use serde_json::json;
+    use uuid::Uuid;
+
+    #[test]
+    fn alert_key_is_unique_per_backup() {
+        let first = Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap();
+        let second = Uuid::parse_str("22222222-2222-2222-2222-222222222222").unwrap();
+
+        assert_ne!(
+            verification_state_key("database", first),
+            verification_state_key("database", second)
+        );
+        assert_ne!(
+            verification_state_key("database", first),
+            verification_state_key("site", first)
+        );
+    }
+
+    #[test]
+    fn failed_agent_response_exposes_the_failed_check() {
+        let outcome = VerificationOutcome::from_agent_response(&json!({
+            "passed": false,
+            "checks_run": 3,
+            "checks_passed": 2,
+            "duration_ms": 5767,
+            "details": [
+                {"name": "file_exists", "passed": true, "message": "Dump file present"},
+                {"name": "temp_container", "passed": false, "message": "Database container was not ready"},
+                {"name": "restore", "passed": true, "message": "Restore completed"}
+            ]
+        }));
+
+        assert!(!outcome.passed);
+        assert_eq!(
+            outcome.error_message.as_deref(),
+            Some("temp_container: Database container was not ready")
+        );
+    }
+
+    #[test]
+    fn passed_agent_response_has_no_error_message() {
+        let outcome = VerificationOutcome::from_agent_response(&json!({
+            "passed": true,
+            "checks_run": 4,
+            "checks_passed": 4,
+            "duration_ms": 42,
+            "details": []
+        }));
+
+        assert!(outcome.passed);
+        assert!(outcome.error_message.is_none());
     }
 }
