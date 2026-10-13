@@ -64,6 +64,55 @@ fn is_safe_config_value(s: &str) -> bool {
     !s.contains('\n') && !s.contains('\r') && !s.contains('\0')
 }
 
+fn render_config(
+    host: &str,
+    port: u16,
+    username: &str,
+    password: &str,
+    from: &str,
+    from_name: &str,
+    encryption: &str,
+) -> String {
+    let tls = match encryption {
+        "none" => "off",
+        _ => "on", // tls, starttls
+    };
+    let tls_starttls = match encryption {
+        "starttls" => "on",
+        "none" => "off",
+        _ => "off", // "tls" means implicit TLS, not STARTTLS
+    };
+
+    // `from_full_name` is the only thing that makes msmtp put a display
+    // name on the `From:` header it auto-adds (msmtp's `from` command is
+    // envelope-from only — a bare address, never a display name).
+    let from_name_line = if from_name.is_empty() {
+        String::new()
+    } else {
+        format!("from_full_name  {from_name}\n")
+    };
+
+    format!(
+        r#"# DockPanel SMTP configuration — managed automatically
+defaults
+auth           on
+tls            {tls}
+tls_starttls   {tls_starttls}
+tls_trust_file /etc/ssl/certs/ca-certificates.crt
+logfile        /var/log/msmtp.log
+
+account        default
+host           {host}
+port           {port}
+from           {from}
+allow_from_override off
+set_from_header on
+{from_name_line}user           {username}
+password       {password}
+"#
+    )
+}
+
 /// Configure msmtp system-wide so PHP mail() and sendmail work.
 pub fn configure(
     host: &str,
@@ -89,46 +138,11 @@ pub fn configure(
 
     ensure_msmtp()?;
 
-    let tls = match encryption {
-        "none" => "off",
-        _ => "on", // tls, starttls
-    };
-    let tls_starttls = match encryption {
-        "starttls" => "on",
-        "none" => "off",
-        _ => "off", // "tls" means implicit TLS, not STARTTLS
-    };
-
-    // `from_full_name` is the only thing that makes msmtp put a display
-    // name on the `From:` header it auto-adds to outgoing mail (msmtp's
-    // `from` command is envelope-from only — a bare address, never a
-    // display name). Omitted entirely when blank rather than emitted as
-    // `from_full_name ` with nothing after it, since msmtp's own argument
-    // grammar reads "the rest of the line" for this directive and an
-    // absent line is the least surprising way to mean "no display name."
-    let from_name_line = if from_name.is_empty() {
-        String::new()
-    } else {
-        format!("from_full_name  {from_name}\n")
-    };
-
-    let config = format!(
-        r#"# DockPanel SMTP configuration — managed automatically
-defaults
-auth           on
-tls            {tls}
-tls_starttls   {tls_starttls}
-tls_trust_file /etc/ssl/certs/ca-certificates.crt
-logfile        /var/log/msmtp.log
-
-account        default
-host           {host}
-port           {port}
-from           {from}
-{from_name_line}user           {username}
-password       {password}
-"#
-    );
+    // The relay is authenticated as one mailbox. Force both the SMTP envelope
+    // sender and the visible From header to that configured identity: otherwise
+    // PHP's sendmail wrapper may substitute `www-data@hostname`, which strict
+    // relays such as OVH accept first and then reject with a delayed bounce.
+    let config = render_config(host, port, username, password, from, from_name, encryption);
 
     // Create the file 0600 from the outset. `fs::write` creates under the umask —
     // 0644 on every distro the installer supports — and line 6 of what is being
@@ -291,5 +305,27 @@ pub async fn send_test(to: &str, from: &str, from_name: &str) -> Result<String, 
     } else {
         let stderr = String::from_utf8_lossy(&output.stderr);
         Err(format!("msmtp failed: {stderr}"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::render_config;
+
+    #[test]
+    fn system_relay_forces_the_authenticated_sender_identity() {
+        let config = render_config(
+            "ssl0.ovh.net",
+            587,
+            "contact@example.test",
+            "not-a-real-password",
+            "contact@example.test",
+            "Example",
+            "starttls",
+        );
+
+        assert!(config.contains("allow_from_override off"));
+        assert!(config.contains("set_from_header on"));
+        assert!(config.contains("from           contact@example.test"));
     }
 }

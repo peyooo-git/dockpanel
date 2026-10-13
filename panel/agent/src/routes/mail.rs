@@ -1851,6 +1851,63 @@ struct RelayConfig {
     password: String,
 }
 
+const RELAY_SENDER_CANONICAL: &str = "/etc/postfix/dockpanel_sender_canonical";
+
+fn relay_sender_map(username: &str) -> Option<String> {
+    let (local, domain) = username.split_once('@')?;
+    if local.is_empty()
+        || domain.is_empty()
+        || domain.contains('@')
+        || username
+            .chars()
+            .any(|c| c.is_whitespace() || matches!(c, '<' | '>' | ',' | ':'))
+    {
+        return None;
+    }
+
+    // PHP-FPM pools run as www-data; root covers scheduled jobs. Canonical maps
+    // try the local part after the full address for local domains, so these two
+    // entries fix both `www-data` and `www-data@hostname` without touching an
+    // application's valid, explicit From address.
+    Some(format!("www-data {username}\nroot {username}\n"))
+}
+
+fn relay_main_cf_block(host: &str, port: u16, force_sender: bool) -> String {
+    let sender_identity = if force_sender {
+        format!(
+            "sender_canonical_classes = envelope_sender, header_sender\n\
+             sender_canonical_maps = hash:{RELAY_SENDER_CANONICAL}\n"
+        )
+    } else {
+        String::new()
+    };
+
+    format!(
+        "\n# DockPanel relay configuration\nrelayhost = [{host}]:{port}\n\
+         smtp_sasl_auth_enable = yes\n\
+         smtp_sasl_password_maps = hash:/etc/postfix/sasl_passwd\n\
+         smtp_sasl_security_options = noanonymous\n\
+         smtp_tls_security_level = encrypt\n\
+         smtp_tls_CAfile = /etc/ssl/certs/ca-certificates.crt\n\
+         {sender_identity}"
+    )
+}
+
+fn strip_relay_config(main_cf: &str) -> String {
+    main_cf
+        .lines()
+        .filter(|line| {
+            !line.starts_with("relayhost")
+                && !line.starts_with("smtp_sasl_")
+                && !line.starts_with("smtp_tls_")
+                && !line.contains("# DockPanel relay")
+                && !line.starts_with("sender_canonical_maps = hash:/etc/postfix/dockpanel_sender_canonical")
+                && !line.starts_with("sender_canonical_classes = envelope_sender, header_sender")
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// POST /mail/relay/configure — Set up SMTP relay (smarthost).
 async fn relay_configure(Json(body): Json<RelayConfig>) -> Result<Json<serde_json::Value>, ApiErr> {
     if body.host.is_empty() { return Err(err(StatusCode::BAD_REQUEST, "Relay host required")); }
@@ -1870,18 +1927,39 @@ async fn relay_configure(Json(body): Json<RelayConfig>) -> Result<Json<serde_jso
     let _ = safe_command("chmod").args(["600", "/etc/postfix/sasl_passwd"]).output().await;
     let _ = safe_command("postmap").arg("/etc/postfix/sasl_passwd").output().await;
 
+    let sender_map = relay_sender_map(&body.username);
+    if let Some(ref map_content) = sender_map {
+        write_file_atomic(RELAY_SENDER_CANONICAL, map_content)
+            .await
+            .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &format!("Failed to write sender map: {e}")))?;
+        let _ = safe_command("chmod").args(["600", RELAY_SENDER_CANONICAL]).output().await;
+        let mapped = safe_command("postmap")
+            .arg(RELAY_SENDER_CANONICAL)
+            .output()
+            .await
+            .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &format!("Failed to compile sender map: {e}")))?;
+        if !mapped.status.success() {
+            return Err(err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!(
+                    "Failed to compile sender map: {}",
+                    String::from_utf8_lossy(&mapped.stderr)
+                ),
+            ));
+        }
+    } else {
+        // API-key style relay usernames are not sender addresses. In that case
+        // leave application From addresses alone and remove any previous map.
+        let _ = tokio::fs::remove_file(RELAY_SENDER_CANONICAL).await;
+        let _ = tokio::fs::remove_file(format!("{RELAY_SENDER_CANONICAL}.db")).await;
+    }
+
     // Update Postfix main.cf
     let main_cf = tokio::fs::read_to_string("/etc/postfix/main.cf").await.unwrap_or_default();
 
     // Remove existing relay config lines
-    let cleaned: String = main_cf.lines()
-        .filter(|l| !l.starts_with("relayhost") && !l.starts_with("smtp_sasl_") && !l.starts_with("smtp_tls_") && !l.contains("# DockPanel relay"))
-        .collect::<Vec<_>>().join("\n");
-
-    let relay_config = format!(
-        "\n# DockPanel relay configuration\nrelayhost = [{}]:{}\nsmtp_sasl_auth_enable = yes\nsmtp_sasl_password_maps = hash:/etc/postfix/sasl_passwd\nsmtp_sasl_security_options = noanonymous\nsmtp_tls_security_level = encrypt\nsmtp_tls_CAfile = /etc/ssl/certs/ca-certificates.crt\n",
-        body.host, body.port
-    );
+    let cleaned = strip_relay_config(&main_cf);
+    let relay_config = relay_main_cf_block(&body.host, body.port, sender_map.is_some());
 
     write_file_atomic("/etc/postfix/main.cf", &format!("{cleaned}{relay_config}")).await
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &format!("Config write failed: {e}")))?;
@@ -1908,15 +1986,15 @@ async fn relay_status() -> Json<serde_json::Value> {
 /// POST /mail/relay/remove — Remove SMTP relay configuration.
 async fn relay_remove() -> Result<Json<serde_json::Value>, ApiErr> {
     let main_cf = tokio::fs::read_to_string("/etc/postfix/main.cf").await.unwrap_or_default();
-    let cleaned: String = main_cf.lines()
-        .filter(|l| !l.starts_with("relayhost") && !l.starts_with("smtp_sasl_") && !l.starts_with("smtp_tls_") && !l.contains("# DockPanel relay"))
-        .collect::<Vec<_>>().join("\n");
+    let cleaned = strip_relay_config(&main_cf);
 
     write_file_atomic("/etc/postfix/main.cf", &cleaned).await
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &format!("Config write failed: {e}")))?;
 
     let _ = tokio::fs::remove_file("/etc/postfix/sasl_passwd").await;
     let _ = tokio::fs::remove_file("/etc/postfix/sasl_passwd.db").await;
+    let _ = tokio::fs::remove_file(RELAY_SENDER_CANONICAL).await;
+    let _ = tokio::fs::remove_file(format!("{RELAY_SENDER_CANONICAL}.db")).await;
     let _ = safe_command("systemctl").args(["reload", "postfix"]).output().await;
 
     Ok(ok("SMTP relay removed"))
@@ -2538,6 +2616,45 @@ async fn write_dovecot_users(content: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn relay_rewrites_only_local_process_senders_to_an_email_login() {
+        let map = relay_sender_map("contact@example.test").expect("email login");
+        assert_eq!(
+            map,
+            "www-data contact@example.test\nroot contact@example.test\n"
+        );
+
+        let config = relay_main_cf_block("smtp.example.test", 587, true);
+        assert!(config.contains("sender_canonical_classes = envelope_sender, header_sender"));
+        assert!(config.contains(&format!(
+            "sender_canonical_maps = hash:{RELAY_SENDER_CANONICAL}"
+        )));
+        assert!(!config.contains("recipient_canonical"));
+    }
+
+    #[test]
+    fn relay_does_not_treat_api_keys_as_sender_addresses() {
+        assert!(relay_sender_map("apikey-not-an-address").is_none());
+        let config = relay_main_cf_block("smtp.example.test", 587, false);
+        assert!(!config.contains("sender_canonical"));
+    }
+
+    #[test]
+    fn relay_reconfiguration_removes_only_its_managed_sender_map() {
+        let existing = format!(
+            "myhostname = host.example\n\
+             sender_canonical_maps = hash:/etc/postfix/custom_sender_map\n\
+             sender_canonical_maps = hash:{RELAY_SENDER_CANONICAL}\n\
+             sender_canonical_classes = envelope_sender, header_sender\n\
+             relayhost = [old.example]:587\n"
+        );
+        let cleaned = strip_relay_config(&existing);
+
+        assert!(cleaned.contains("hash:/etc/postfix/custom_sender_map"));
+        assert!(!cleaned.contains(RELAY_SENDER_CANONICAL));
+        assert!(!cleaned.contains("relayhost"));
+    }
 
     /// The regression this helper exists for: between s268 and s270 the value
     /// on the line was `inet:127.0.0.1:8891`, and the old code matched the
